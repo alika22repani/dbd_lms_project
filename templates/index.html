@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Peramalan Kasus DBD Bulanan Indonesia (LSTM)</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#f6f8fb; --card:#fff; --text:#1c2733; --muted:#5b6b7b; --accent:#c0392b; --line:#2c6fbb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  header { background:#1f2d3d; color:#fff; padding:22px 20px; }
+  header h1 { margin:0 0 4px; font-size:1.35rem; }
+  header p { margin:0; color:#b8c4d0; font-size:.9rem; }
+  main { max-width:1000px; margin:0 auto; padding:18px; display:grid; gap:16px; }
+  .card { background:var(--card); border-radius:10px; padding:16px 18px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+  .card h2 { margin:0 0 10px; font-size:1.05rem; }
+  .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
+  .metric { background:#f0f4f9; border-radius:8px; padding:10px 12px; }
+  .metric b { display:block; font-size:1.2rem; }
+  .metric span { font-size:.78rem; color:var(--muted); }
+  .controls { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:10px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:8px 16px; cursor:pointer; font-size:.9rem; }
+  button:disabled { opacity:.6; cursor:wait; }
+  canvas { max-height:340px; }
+  table { border-collapse:collapse; width:100%; font-size:.88rem; margin-top:10px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #e3e8ee; }
+  .note { font-size:.82rem; color:var(--muted); line-height:1.5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Peramalan Kasus DBD Bulanan di Indonesia</h1>
+  <p>Model LSTM &middot; Data: OpenDengue &middot; Sumber deret: {{ meta.source }}</p>
+</header>
+<main>
+  <section class="card">
+    <h2>Kinerja Model pada Data Uji ({{ meta.test_start[:7] }} s.d. {{ meta.last_date[:7] }})</h2>
+    <div class="metrics" id="metrics"></div>
+    <p class="note">RMSE/MAE dalam satuan jumlah kasus per bulan. Baseline dipakai untuk menilai apakah LSTM benar-benar memberi nilai tambah.</p>
+  </section>
+
+  <section class="card">
+    <h2>Data Historis</h2>
+    <canvas id="histChart"></canvas>
+  </section>
+
+  <section class="card">
+    <h2>Aktual vs Prediksi LSTM (Data Uji)</h2>
+    <canvas id="testChart"></canvas>
+  </section>
+
+  <section class="card">
+    <h2>Peramalan ke Depan</h2>
+    <div class="controls">
+      <label for="n">Horizon (bulan):</label>
+      <input type="range" id="n" min="1" max="12" value="6" oninput="nv.textContent=this.value">
+      <b id="nv">6</b>
+      <button id="btn" onclick="runForecast()">Jalankan Forecast</button>
+    </div>
+    <canvas id="fcChart"></canvas>
+    <table id="fcTable"></table>
+    <p class="note">Forecast bersifat rekursif: galat menumpuk pada horizon yang jauh. Hasil ini adalah estimasi tren dari pola historis, bukan pengganti data surveilans resmi maupun keputusan kesehatan masyarakat.</p>
+  </section>
+</main>
+
+<script>
+let hist, test, fcChart;
+const fmt = v => Math.round(v).toLocaleString("id-ID");
+
+function lineChart(id, labels, datasets) {
+  return new Chart(document.getElementById(id), {
+    type: "line",
+    data: { labels, datasets },
+    options: { responsive: true, interaction: { mode: "index", intersect: false },
+               elements: { point: { radius: 1.5 } },
+               scales: { y: { title: { display: true, text: "Jumlah kasus" } } } }
+  });
+}
+
+async function init() {
+  const d = await (await fetch("/api/data")).json();
+  hist = d.history; test = d.test;
+
+  const m = d.meta.metrics, box = document.getElementById("metrics");
+  for (const [name, v] of Object.entries(m)) {
+    box.insertAdjacentHTML("beforeend",
+      `<div class="metric"><span>${name}</span><b>RMSE ${fmt(v.RMSE)}</b><span>MAE ${fmt(v.MAE)} &middot; MAPE ${v["MAPE_%"]}%</span></div>`);
+  }
+
+  lineChart("histChart", hist.dates,
+    [{ label: "Kasus bulanan", data: hist.values, borderColor: "#2c6fbb", borderWidth: 1.6 }]);
+  lineChart("testChart", test.dates, [
+    { label: "Aktual", data: test.actual, borderColor: "#2c6fbb" },
+    { label: "Prediksi LSTM", data: test.predicted, borderColor: "#e67e22" }]);
+  runForecast();
+}
+
+async function runForecast() {
+  const btn = document.getElementById("btn"); btn.disabled = true; btn.textContent = "Menghitung...";
+  const n = document.getElementById("n").value;
+  try {
+    const f = await (await fetch("/api/forecast?n=" + n)).json();
+    const tail = 36, hd = hist.dates.slice(-tail), hv = hist.values.slice(-tail);
+    const labels = hd.concat(f.dates);
+    const hSeries = hv.concat(Array(f.dates.length).fill(null));
+    const fSeries = Array(hd.length - 1).fill(null).concat([hv[hv.length - 1]], f.values);
+    if (fcChart) fcChart.destroy();
+    fcChart = lineChart("fcChart", labels, [
+      { label: "Historis", data: hSeries, borderColor: "#2c6fbb" },
+      { label: "Forecast", data: fSeries, borderColor: "#c0392b", borderDash: [6, 4], pointRadius: 3 }]);
+    document.getElementById("fcTable").innerHTML =
+      "<tr><th>Bulan</th><th>Prediksi kasus</th></tr>" +
+      f.dates.map((dt, i) => `<tr><td>${dt}</td><td>${fmt(f.values[i])}</td></tr>`).join("");
+  } finally { btn.disabled = false; btn.textContent = "Jalankan Forecast"; }
+}
+init();
+</script>
+</body>
+</html>
